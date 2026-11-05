@@ -23,6 +23,75 @@
 #include "glsl_parser.h"
 #include "glsl.parser.h"
 
+/* Numeric literal helpers (GLSL 4.1.4 / Appendix A).
+   Self-contained (no strtol/ldexp) so the lexer builds both here
+   (freestanding WASM) and in the upstream gcc build. */
+
+static int glsl_hex_digit_value(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static int glsl_int_has_suffix(const char *s)
+{
+    const char *e = s;
+    while (*e)
+        e++;
+    return e > s && (e[-1] == 'u' || e[-1] == 'U' ||
+                     e[-1] == 'l' || e[-1] == 'L');
+}
+
+static unsigned long glsl_parse_hex_int(const char *s)
+{
+    unsigned long v = 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+        s += 2;
+    while (*s) {
+        int d = glsl_hex_digit_value(*s);
+        if (d < 0)
+            break; /* suffix (u/l) or end */
+        v = v * 16 + (unsigned)d;
+        s++;
+    }
+    return v;
+}
+
+static double glsl_parse_hex_float(const char *s)
+{
+    /* HexadecimalFloatingLiteral: 0x HexDigit+ p Exponent (no hex fraction) */
+    unsigned long mant = glsl_parse_hex_int(s);
+    const char *p = s;
+    while (*p && *p != 'p' && *p != 'P')
+        p++;
+    int exp = 0;
+    if (*p == 'p' || *p == 'P') {
+        int neg = 0;
+        p++;
+        if (*p == '+')
+            p++;
+        else if (*p == '-') {
+            neg = 1;
+            p++;
+        }
+        while (*p >= '0' && *p <= '9') {
+            exp = exp * 10 + (*p - '0');
+            p++;
+        }
+        if (neg)
+            exp = -exp;
+    }
+    double v = (double)mant;
+    while (exp > 0) { v *= 2.0; exp--; }
+    while (exp < 0) { v /= 2.0; exp++; }
+    return v;
+}
+
 %}
 
 
@@ -37,8 +106,10 @@ ws			[ \t]+
 digit			[0-9]
 nondigit		[_a-zA-Z]
 identifier		{nondigit}({nondigit}|{digit})*
-integer_constant	{digit}+
-floating_constant	{digit}+\.{digit}+
+hexdigit		[0-9a-fA-F]
+integer_constant	0[xX]{hexdigit}+([uU][lL]?|[lL][uU]?)?|{digit}+([uU][lL]?|[lL][uU]?)?
+hex_float_constant	0[xX]{hexdigit}+[pP][+-]?{digit}+
+floating_constant	{digit}+\.{digit}*([eE][+-]?{digit}+)?[fF]?|{digit}+[eE][+-]?{digit}+[fF]?
 
 %x COMMENT
 
@@ -264,7 +335,24 @@ true			{ return TRUE_VALUE; }
 false			{ return FALSE_VALUE; }
 
 {identifier}		{ (*yylval).IDENTIFIER = strdup(yytext); return IDENTIFIER; }
-{integer_constant}	{ (*yylval).INTCONSTANT = atoi(yytext); return INTCONSTANT; }
+{integer_constant}	{
+    if (yytext[0] == '0' && (yytext[1] == 'x' || yytext[1] == 'X')) {
+        unsigned long v = glsl_parse_hex_int(yytext);
+        if (glsl_int_has_suffix(yytext)) {
+            (*yylval).UINTCONSTANT = (unsigned int)v;
+            return UINTCONSTANT;
+        }
+        (*yylval).INTCONSTANT = (int)v;
+        return INTCONSTANT;
+    }
+    if (glsl_int_has_suffix(yytext)) {
+        (*yylval).UINTCONSTANT = (unsigned int)atoi(yytext);
+        return UINTCONSTANT;
+    }
+    (*yylval).INTCONSTANT = atoi(yytext);
+    return INTCONSTANT;
+}
+{hex_float_constant}	{ (*yylval).FLOATCONSTANT = glsl_parse_hex_float(yytext); return FLOATCONSTANT; }
 {floating_constant}	{ (*yylval).FLOATCONSTANT = atof(yytext); return FLOATCONSTANT; }
 
 %%
